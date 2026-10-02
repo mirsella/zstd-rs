@@ -12,30 +12,6 @@ extern crate alloc;
 #[cfg(target_arch = "wasm32")]
 mod wasm_shim;
 
-// If running bindgen, we'll end up with the correct bindings anyway.
-#[cfg(feature = "bindgen")]
+// The build script selects pregenerated bindings or runs bindgen, and attaches native
+// library metadata when these bindings will cross a Rust dylib boundary.
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
-
-// The bindings used depend on a few feature flags.
-#[cfg(all(not(feature = "experimental"), not(feature = "bindgen")))]
-include!("bindings_zstd.rs");
-
-#[cfg(all(
-    not(feature = "experimental"),
-    feature = "zdict_builder",
-    not(feature = "bindgen")
-))]
-include!("bindings_zdict.rs");
-
-#[cfg(all(feature = "experimental", not(feature = "bindgen")))]
-include!("bindings_zstd_experimental.rs");
-
-#[cfg(all(
-    feature = "experimental",
-    feature = "zdict_builder",
-    not(feature = "bindgen")
-))]
-include!("bindings_zdict_experimental.rs");
-
-#[cfg(all(feature = "seekable", not(feature = "bindgen")))]
-include!("bindings_zstd_seekable.rs");

@@ -82,6 +82,7 @@ debug = [] # Enable zstd debug logs
 experimental = [] # Expose experimental ZSTD API
 legacy = [] # Enable legacy ZSTD support (for versions < zstd-0.8)
 non-cargo = [] # Silence cargo-specific build flags
+rust-dylib = [] # Export native APIs needed by generic calls outside a Rust dylib.
 pkg-config = [] # Use pkg-config to build the zstd C library.
 vendored = [] # Always use vendored source code of zstd C library.
 std = [] # Deprecated: we never use types from std.

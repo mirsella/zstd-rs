@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::{env, fmt, fs};
 
 #[cfg(feature = "cmake")]
-fn compile_zstd_cmake() {
+fn compile_zstd() -> (PathBuf, &'static str) {
     let mut config = cmake::Config::new("zstd/build/cmake");
 
     // Build only the static library
@@ -14,25 +14,12 @@ fn compile_zstd_cmake() {
     config.define("ZSTD_BUILD_TESTS", "OFF");
     config.define("ZSTD_BUILD_CONTRIB", "OFF");
 
-    // Legacy support
-    if cfg!(feature = "legacy") {
-        config.define("ZSTD_LEGACY_SUPPORT", "ON");
-    } else {
-        config.define("ZSTD_LEGACY_SUPPORT", "OFF");
-    }
-
-    // Multi-threading support
-    if cfg!(feature = "zstdmt") {
-        config.define("ZSTD_MULTITHREAD_SUPPORT", "ON");
-    } else {
-        config.define("ZSTD_MULTITHREAD_SUPPORT", "OFF");
-    }
-
-    // Dictionary builder
-    if cfg!(feature = "zdict_builder") {
-        config.define("ZSTD_BUILD_DICTBUILDER", "ON");
-    } else {
-        config.define("ZSTD_BUILD_DICTBUILDER", "OFF");
+    for (flag, enabled) in [
+        ("ZSTD_LEGACY_SUPPORT", cfg!(feature = "legacy")),
+        ("ZSTD_MULTITHREAD_SUPPORT", cfg!(feature = "zstdmt")),
+        ("ZSTD_BUILD_DICTBUILDER", cfg!(feature = "zdict_builder")),
+    ] {
+        config.define(flag, if enabled { "ON" } else { "OFF" });
     }
 
     // Hide symbols so we can coexist with another zstd-linking lib.
@@ -125,28 +112,22 @@ fn compile_zstd_cmake() {
     // On MSVC, the static library is named zstd_static.
     // This has to follow the target env: build scripts are compiled for the
     // host, so cfg!(target_env) would be wrong when cross-compiling.
-    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
-    if target_env == "msvc" {
-        cargo_print(&"rustc-link-lib=static=zstd_static");
+    let link_name = if target_is_msvc() {
+        "zstd_static"
     } else {
-        cargo_print(&"rustc-link-lib=static=zstd");
-    }
+        "zstd"
+    };
+    cargo_print(&format_args!("rustc-link-lib=static={link_name}"));
 
-    // Copy headers for downstream consumers
-    let src = env::current_dir().unwrap().join("zstd").join("lib");
-    let include = dst.join("include");
-    fs::create_dir_all(&include).unwrap();
-    fs::copy(src.join("zstd.h"), include.join("zstd.h")).unwrap();
-    fs::copy(src.join("zstd_errors.h"), include.join("zstd_errors.h"))
-        .unwrap();
-    #[cfg(feature = "zdict_builder")]
-    fs::copy(src.join("zdict.h"), include.join("zdict.h")).unwrap();
-    cargo_print(&format_args!("root={}", dst.display()));
-    cargo_print(&format_args!("include={}", include.display()));
+    (dst, link_name)
 }
 
 #[cfg(feature = "bindgen")]
-fn generate_bindings(defs: Vec<&str>, headerpaths: Vec<PathBuf>) {
+fn generate_bindings(
+    defs: Vec<&str>,
+    headerpaths: Vec<PathBuf>,
+    link_name: &str,
+) {
     use bindgen::RustTarget;
 
     let bindings = bindgen::Builder::default().header("zstd.h");
@@ -186,65 +167,67 @@ fn generate_bindings(defs: Vec<&str>, headerpaths: Vec<PathBuf>) {
 
     let bindings = bindings.generate().expect("Unable to generate bindings");
 
-    let out_path = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    bindings
-        .write_to_file(out_path.join("bindings.rs"))
-        .expect("Could not write bindings");
+    write_bindings(bindings.to_string(), link_name);
 }
 
 #[cfg(not(feature = "bindgen"))]
-fn generate_bindings(_: Vec<&str>, _: Vec<PathBuf>) {}
+fn generate_bindings(_: Vec<&str>, _: Vec<PathBuf>, link_name: &str) {
+    let suffix = if cfg!(feature = "experimental") {
+        "_experimental"
+    } else {
+        ""
+    };
+    let mut bindings = String::new();
+    for file in [
+        Some(format!("src/bindings_zstd{suffix}.rs")),
+        cfg!(feature = "zdict_builder")
+            .then(|| format!("src/bindings_zdict{suffix}.rs")),
+        cfg!(feature = "seekable")
+            .then(|| "src/bindings_zstd_seekable.rs".to_owned()),
+    ]
+    .iter()
+    .flatten()
+    {
+        cargo_print(&format_args!("rerun-if-changed={file}"));
+        bindings.push_str(
+            &fs::read_to_string(file).expect("read pregenerated bindings"),
+        );
+        bindings.push('\n');
+    }
+    write_bindings(bindings, link_name);
+}
 
-fn pkg_config() -> (Vec<&'static str>, Vec<PathBuf>) {
+fn write_bindings(mut bindings: String, link_name: &str) {
+    if cfg!(feature = "rust-dylib") {
+        // rustc needs the native-library association on the extern blocks, not just
+        // build-script linker flags, to export APIs used by downstream monomorphizations.
+        // See rust-lang/rust#65610.
+        assert!(bindings.contains("extern \"C\" {"), "bindings must contain C extern blocks to associate with the native library");
+        bindings = bindings.replace("extern \"C\" {", &format!("#[link(name = \"{link_name}\", kind = \"static\")]\nextern \"C\" {{"));
+    }
+    fs::write(
+        PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("bindings.rs"),
+        bindings,
+    )
+    .expect("write bindings");
+}
+
+fn pkg_config() -> (Vec<&'static str>, Vec<PathBuf>, String) {
     let library = pkg_config::Config::new()
         .statik(true)
         .cargo_metadata(!cfg!(feature = "non-cargo"))
         .probe("libzstd")
         .expect("Can't probe for zstd in pkg-config");
-    (vec!["PKG_CONFIG"], library.include_paths)
-}
-
-#[cfg(all(not(feature = "legacy"), not(feature = "cmake")))]
-fn set_legacy(_config: &mut cc::Build) {}
-
-#[cfg(all(feature = "legacy", not(feature = "cmake")))]
-fn set_legacy(config: &mut cc::Build) {
-    config.define("ZSTD_LEGACY_SUPPORT", Some("1"));
-    config.include("zstd/lib/legacy");
-}
-
-#[cfg(all(feature = "zstdmt", not(feature = "cmake")))]
-fn set_pthread(config: &mut cc::Build) {
-    config.flag("-pthread");
-}
-
-#[cfg(all(not(feature = "zstdmt"), not(feature = "cmake")))]
-fn set_pthread(_config: &mut cc::Build) {}
-
-#[cfg(all(feature = "zstdmt", not(feature = "cmake")))]
-fn enable_threading(config: &mut cc::Build) {
-    config.define("ZSTD_MULTITHREAD", Some(""));
-}
-
-#[cfg(all(not(feature = "zstdmt"), not(feature = "cmake")))]
-fn enable_threading(_config: &mut cc::Build) {}
-
-/// This function would find the first flag in `flags` that is supported
-/// and add that to `config`.
-#[cfg(not(feature = "cmake"))]
-#[allow(dead_code)]
-fn flag_if_supported_with_fallbacks(config: &mut cc::Build, flags: &[&str]) {
-    let option = flags
-        .iter()
-        .find(|flag| config.is_flag_supported(flag).unwrap_or_default());
-
-    if let Some(flag) = option {
-        config.flag(flag);
-    }
+    let link_name = library
+        .libs
+        .into_iter()
+        .next()
+        .expect("libzstd.pc must name its native library");
+    (vec!["PKG_CONFIG"], library.include_paths, link_name)
 }
 
 #[cfg(not(feature = "cmake"))]
-fn compile_zstd() {
+fn compile_zstd() -> (PathBuf, &'static str) {
     let mut config = cc::Build::new();
 
     // Search the following directories for C files to add to the compilation.
@@ -334,10 +317,13 @@ fn compile_zstd() {
     if cfg!(feature = "fat-lto") {
         config.flag_if_supported("-flto");
     } else if cfg!(feature = "thin-lto") {
-        flag_if_supported_with_fallbacks(
-            &mut config,
-            &["-flto=thin", "-flto"],
-        );
+        if let Some(flag) = ["-flto=thin", "-flto"].iter().find(|flag| {
+            config
+                .is_flag_supported(flag)
+                .expect("probe compiler LTO support")
+        }) {
+            config.flag(flag);
+        }
     }
 
     #[cfg(feature = "thin")]
@@ -393,23 +379,18 @@ fn compile_zstd() {
         config.define("DEBUGLEVEL", Some("5"));
     }
 
-    set_pthread(&mut config);
-    set_legacy(&mut config);
-    enable_threading(&mut config);
+    if cfg!(feature = "legacy") {
+        config.define("ZSTD_LEGACY_SUPPORT", Some("1"));
+        config.include("zstd/lib/legacy");
+    }
+    if cfg!(feature = "zstdmt") {
+        config.flag("-pthread").define("ZSTD_MULTITHREAD", Some(""));
+    }
 
     // Compile!
     config.compile("libzstd.a");
 
-    let src = env::current_dir().unwrap().join("zstd").join("lib");
-    let dst = PathBuf::from(env::var_os("OUT_DIR").unwrap());
-    let include = dst.join("include");
-    fs::create_dir_all(&include).unwrap();
-    fs::copy(src.join("zstd.h"), include.join("zstd.h")).unwrap();
-    fs::copy(src.join("zstd_errors.h"), include.join("zstd_errors.h"))
-        .unwrap();
-    #[cfg(feature = "zdict_builder")]
-    fs::copy(src.join("zdict.h"), include.join("zdict.h")).unwrap();
-    cargo_print(&format_args!("root={}", dst.display()));
+    (PathBuf::from(env::var_os("OUT_DIR").unwrap()), "zstd")
 }
 
 /// Is the *target* toolchain MSVC?
@@ -432,7 +413,8 @@ fn target_is_msvc() -> bool {
 /// ZSTD_SYS_NO_HIDE_SYMBOLS exports them instead - at the cost of that other
 /// library then using our zstd rather than the system one.
 fn hide_symbols() -> bool {
-    env::var_os("ZSTD_SYS_NO_HIDE_SYMBOLS").is_none()
+    !cfg!(feature = "rust-dylib")
+        && env::var_os("ZSTD_SYS_NO_HIDE_SYMBOLS").is_none()
 }
 
 /// Print a line for cargo.
@@ -456,8 +438,7 @@ fn main() {
         cargo_print(&"rustc-cfg=feature=\"std\"");
     }
 
-    // println!("cargo:rustc-link-lib=zstd");
-    let (defs, headerpaths) = if (cfg!(feature = "pkg-config")
+    let (defs, headerpaths, link_name) = if (cfg!(feature = "pkg-config")
         && !cfg!(feature = "vendored"))
         || env::var_os("ZSTD_SYS_USE_PKG_CONFIG").is_some()
     {
@@ -472,11 +453,20 @@ fn main() {
                 .expect("Manifest dir is always set by cargo"),
         );
 
-        #[cfg(feature = "cmake")]
-        compile_zstd_cmake();
-        #[cfg(not(feature = "cmake"))]
-        compile_zstd();
-        (vec![], vec![manifest_dir.join("zstd/lib")])
+        let (root, link_name) = compile_zstd();
+        let src = manifest_dir.join("zstd/lib");
+        let include = root.join("include");
+        fs::create_dir_all(&include).unwrap();
+        for header in [
+            "zstd.h",
+            "zstd_errors.h",
+            #[cfg(feature = "zdict_builder")]
+            "zdict.h",
+        ] {
+            fs::copy(src.join(header), include.join(header)).unwrap();
+        }
+        cargo_print(&format_args!("root={}", root.display()));
+        (vec![], vec![include], link_name.to_owned())
     };
 
     let includes: Vec<_> = headerpaths
@@ -485,5 +475,5 @@ fn main() {
         .collect();
     cargo_print(&format_args!("include={}", includes.join(";")));
 
-    generate_bindings(defs, headerpaths);
+    generate_bindings(defs, headerpaths, &link_name);
 }
