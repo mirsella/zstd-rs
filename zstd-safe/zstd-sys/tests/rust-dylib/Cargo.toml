@@ -1,0 +1,23 @@
+[package]
+name = "zstd-dylib-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = ["shared"]
+resolver = "2"
+
+[dependencies]
+zstd = { path = "../../../.." }
+zstd-dylib-shared = { path = "shared" }
+
+[features]
+default = ["rust-dylib"]
+rust-dylib = ["zstd-dylib-shared/rust-dylib"]
+bindgen = ["zstd-dylib-shared/bindgen"]
+cmake = ["zstd-dylib-shared/cmake"]
+seekable = ["zstd-dylib-shared/seekable"]
+
+[profile.dev.package."*"]
+opt-level = 3

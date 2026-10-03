@@ -1,0 +1,18 @@
+[package]
+name = "zstd-dylib-shared"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["dylib"]
+
+[dependencies]
+zstd = { path = "../../../../.." }
+zstd-sys = { path = "../../..", default-features = false }
+
+[features]
+rust-dylib = ["zstd-sys/rust-dylib"]
+bindgen = ["zstd-sys/bindgen"]
+cmake = ["zstd-sys/cmake"]
+seekable = ["zstd-sys/seekable"]
